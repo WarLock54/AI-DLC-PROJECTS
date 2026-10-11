@@ -1,0 +1,204 @@
+# Community Event Board pipeline (unit C2).
+#
+# Push to main:          validate -> deploy -> health-check (exit 0 only when the app answers).
+# Merge request:         validate only (no AWS credentials, no deploy).
+# Run pipeline on main
+#   with TEARDOWN=true:  teardown only (debug-sandbox cleanup). A push to main ignores TEARDOWN.
+#
+# AWS access uses only AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, and AWS_DEFAULT_REGION from
+# masked GitLab CI/CD variables. Nothing here prints credentials or dumps the environment.
+# See docs/c2-ci-cd.md.
+
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH == "main"
+    - if: $CI_PIPELINE_SOURCE == "web" && $CI_COMMIT_BRANCH == "main"
+    - if: $CI_PIPELINE_SOURCE == "api" && $CI_COMMIT_BRANCH == "main"
+
+stages:
+  - validate
+  - deploy
+  - health-check
+  - teardown
+
+variables:
+  npm_config_cache: "$CI_PROJECT_DIR/.npm"
+
+default:
+  # Pinned exact patch tag; the full (non-slim) variant ships git, which the
+  # prohibited-token check needs for `git ls-files`.
+  image: node:22.23.3-bookworm
+  before_script:
+    - npm ci --no-audit --no-fund
+  cache:
+    key:
+      files:
+        - package-lock.json
+    paths:
+      - .npm/
+
+# --- Rule templates ----------------------------------------------------------
+
+# Validate jobs: merge requests, pushes to main, and non-teardown manual/API runs on main.
+.validate:
+  stage: validate
+  interruptible: true
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "web" && $TEARDOWN == "true"
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "api" && $TEARDOWN == "true"
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "main"
+
+# Deploy-path jobs: main only, never on merge requests, never in a teardown pipeline.
+# No `when: manual` and no `allow_failure`: the pipeline fails if any of them fails.
+.deploy-path:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "web" && $TEARDOWN == "true"
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "api" && $TEARDOWN == "true"
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+      when: never
+    - if: $CI_COMMIT_BRANCH == "main"
+
+# --- validate ----------------------------------------------------------------
+
+lint:
+  extends: .validate
+  script:
+    - npm run build
+    - npm run lint
+    - npm run format:check
+    # C7: the evidence manifest maps every approved expectation to existing proof and
+    # fails if debug-only evidence appears in this pipeline. Runs no AWS call.
+    - npm run evidence:manifest-check
+
+test:
+  extends: .validate
+  script:
+    # Unit tests with coverage, CDK assertion and cdk-nag tests, then C2's, C6's, and C5's own tests.
+    - npm run test:c1-foundation
+    - npm run test:c1-foundation:integration
+    - npm run test:c2-ci-cd
+    - npm run test:c6-async-monitoring
+    # C3 event APIs: unit tests with the 80% line-coverage floor, including the RSVP
+    # concurrency proof (NFR25, NFR26), then its CDK assertion and cdk-nag tests.
+    - npm run test:c3-event-apis
+    - npm run test:c3-event-apis:integration
+    # C4 UI: unit tests with the 80% line-coverage floor, then its CDK assertion and cdk-nag tests.
+    - npm run test:c4-ui
+    - npm run test:c4-ui:integration
+    # C5 reminders, statistics, and archival: unit tests with the 80% line-coverage floor,
+    # then its CDK assertion and cdk-nag tests.
+    - npm run test:c5-reminders-statistics-archival
+    - npm run test:c5-reminders-statistics-archival:integration
+    # C7 evidence logic (profile, metrics, redaction, renderers, cost model, manifest):
+    # unit tests with the 80% line-coverage floor. The load test, SES proof, and
+    # cleanup proof themselves are debug-sandbox only and never run here.
+    - npm run test:c7-evidence-release
+  # GitLab shows one coverage number on the merge request: it reads the last
+  # "Lines : NN%" summary in this log, so it reflects the final suite (C7), not a
+  # project total. Per-Unit numbers stay in the log and in the coverage/ artifact.
+  coverage: '/Lines\s*:\s*(\d+(?:\.\d+)?)%/'
+  artifacts:
+    when: always
+    expire_in: 7 days
+    paths:
+      - coverage/
+
+synth:
+  extends: .validate
+  variables:
+    # Fallback for merge request pipelines, where protected CI/CD variables are absent.
+    # A GitLab project variable with the same name takes precedence over this value.
+    AWS_DEFAULT_REGION: us-east-1
+  script:
+    # CDK synthesis with the AwsSolutions cdk-nag aspect; error findings fail synthesis.
+    - npm run synth
+
+dependency-audit:
+  extends: .validate
+  script:
+    # High/Critical advisories block unless a documented waiver (owner, justification, expiry) applies.
+    - npm run security-audit
+
+secret-scan:
+  extends: .validate
+  image:
+    name: zricethezav/gitleaks:v8.30.1
+    entrypoint: [""]
+  variables:
+    GIT_DEPTH: "0"
+  before_script: []
+  cache: []
+  script:
+    - git config --global --add safe.directory "$CI_PROJECT_DIR"
+    # Full history; --redact keeps any detected value out of the job log; any finding fails the job.
+    - gitleaks git --redact --verbose --exit-code 1 "$CI_PROJECT_DIR"
+
+prohibited-token-check:
+  extends: .validate
+  script:
+    - npm run prohibited-token-check
+
+# --- deploy ------------------------------------------------------------------
+
+deploy:
+  stage: deploy
+  extends: .deploy-path
+  needs:
+    - lint
+    - test
+    - synth
+    - dependency-audit
+    - secret-scan
+    - prohibited-token-check
+  # Serializes deployments (and teardown) so two pipelines never change the stack at once.
+  resource_group: team32-ceb-deploy
+  timeout: 90 minutes
+  script:
+    # Idempotent `cdk bootstrap`, then `cdk deploy --require-approval never`, then C-01 output checks.
+    - npm run deploy
+    # Idempotent deterministic seed data (synthetic demo users and events).
+    - npm run seed
+    # C5 (C-06 postDeploy, FR9.3/FR9.6): archive the seeded older-than-one-year event once,
+    # fail on any per-event failure, then prove the archive/ object and its absence from
+    # the public API. Rerunning is idempotent; up to 3 attempts, 20 s apart.
+    - npx tsx scripts/ci/retry-cli.ts --attempts 3 --delay-seconds 20 -- npm run archive-invoke
+  artifacts:
+    # Stack outputs (URLs, IDs, one secret ARN; no secret values) for the health check.
+    paths:
+      - cdk-outputs.json
+    expire_in: 1 day
+
+health-check:
+  stage: health-check
+  extends: .deploy-path
+  needs:
+    - job: deploy
+      artifacts: true
+  script:
+    # Up to 10 attempts, 30 s apart (about 5 minutes); fails the pipeline if the
+    # HTTPS /api/health endpoint never returns 200 {"status":"ok"}.
+    - npx tsx scripts/ci/retry-cli.ts --attempts 10 --delay-seconds 30 -- npm run health-check
+    # C5 (FR8.5, Q4 A): admin statistics must match docs/expected-stats.json (RSVP fields
+    # exactly, view counts as a lower bound). Signs in the seeded admin; prints no secret.
+    - npx tsx scripts/ci/retry-cli.ts --attempts 3 --delay-seconds 20 -- npm run stats-check
+
+# --- teardown (debug sandbox only) -------------------------------------------
+
+teardown:
+  stage: teardown
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "web" && $TEARDOWN == "true" && $CI_COMMIT_BRANCH == "main"
+    - if: $CI_PIPELINE_SOURCE == "api" && $TEARDOWN == "true" && $CI_COMMIT_BRANCH == "main"
+  needs: []
+  resource_group: team32-ceb-deploy
+  timeout: 90 minutes
+  script:
+    # Deletes team32-ceb- stacks and retained project=team32-ceb resources, then
+    # proves the inventory is empty; exits non-zero if anything remains.
+    - npm run teardown

@@ -1,0 +1,20 @@
+# Varsayılan: metin dosyaları repoda ve çalışma kopyasında LF satır sonuyla tutulur.
+# (Windows/macOS farkı ve Linux CI runner'ı için tek format)
+* text=auto eol=lf
+
+# Windows'ta çalıştırılan PowerShell script'leri CRLF ile açılır
+*.ps1 text eol=crlf
+
+# Linux runner'da (GitLab CI) çalışacak shell script'leri her zaman LF
+*.sh text eol=lf
+
+# İkili dosyalar: satır sonu dönüşümü yapılmaz
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.ico  binary
+*.pdf  binary
+*.pptx binary
+*.docx binary
+*.zip  binary

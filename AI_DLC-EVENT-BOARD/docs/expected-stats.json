@@ -1,0 +1,12 @@
+{
+  "description": "FR8.4 expected GET /api/admin/stats values for the deterministic C1 seed data (src/seed/fixtures.ts). Q4 A: RSVP-derived fields must match exactly; view counts depend on traffic and are checked as integers at or above the lower bound.",
+  "contract": "C-02 AdminStats",
+  "exact": {
+    "totalRsvps": 1,
+    "popularCategories": [{ "category": "Community", "count": 1 }]
+  },
+  "lowerBound": {
+    "pageViews": 0,
+    "detailViews": 0
+  }
+}

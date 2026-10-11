@@ -1,0 +1,4 @@
+# Synthetic redaction-test fixture (fake values, no real credentials) in the C7 history.
+# The fixture is now assembled at run time, so new commits no longer match.
+b594481ce3be359961333c4da3bd16ebcf36c84f:test/c7-evidence-release/unit/redact.test.ts:generic-api-key:11
+1d88d28ed2e911eac0e5b11fed3a61f61490b871:test/c7-evidence-release/unit/redact.test.ts:generic-api-key:11

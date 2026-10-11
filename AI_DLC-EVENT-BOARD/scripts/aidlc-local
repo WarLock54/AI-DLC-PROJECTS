@@ -1,0 +1,6 @@
+#!/bin/sh
+# Run the reviewed project engine sources; native installations embed their
+# own engine and therefore do not pick up project source fixes.
+set -eu
+project_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+exec bun "$project_root/.claude/tools/aidlc.ts" "$@"
